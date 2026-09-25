@@ -1,8 +1,9 @@
 """Two ways to pick a guardrail system prompt under a risk cap alpha.
 
-CPS   Certified Prompt Search. Build a fixed pool, certify each prompt on
-      the eval split with a Bonferroni Clopper--Pearson upper bound, and
-      keep the certified prompt with the best utility lower bound.
+CPS   Certified Prompt Search. Take the prompts an optimizer returns,
+      certify each one on the eval split with a Bonferroni Clopper--Pearson
+      upper bound, and keep the certified prompt with the best utility
+      lower bound.
 
 CRISP Closed-loop search. Rewrite the current prompt from its train errors.
       Risk on the eval split is read only through Guess-and-Check.
@@ -26,20 +27,23 @@ def _mine(prompt, train, want_y, want_d):
     return [(t, want_y) for t, d in zip(texts, decisions) if d == want_d]
 
 
-def cps(train, eval_split, alpha=config.ALPHA, delta=config.DELTA,
-        pool_size=config.CPS_POOL_SIZE, candidate_prompts=None, log=print):
-    """Certify a fixed pool. Pass candidate_prompts to skip generation."""
+def cps(train, eval_split, seed, optimizer, alpha=config.ALPHA, delta=config.DELTA,
+        log=print):
+    """Certify the prompts an optimizer returns.
+
+    optimizer(train, eval_split, seed) -> list of system prompts, as GEPA would.
+    """
     texts, labels = _xy(eval_split)
-    if candidate_prompts:
-        pool = []
-        for p in candidate_prompts:
-            if p and p not in pool:
-                pool.append(p)
-        pool = pool[:pool_size]
-    else:
-        pool = prompts.generate_pool(train, pool_size)
+    pool = []
+    for p in optimizer(train, eval_split, seed):
+        if p and p not in pool:
+            pool.append(p)
 
     n = len(pool)
+    if n == 0:
+        log("[CPS] optimizer returned no prompts")
+        return {"method": "CPS", "selected_prompt": None,
+                "n_pool": 0, "n_certified": 0, "records": []}
     records = []
     for i, prompt in enumerate(pool):
         rec = guardrail.evaluate_prompt(prompt, texts, labels)
@@ -53,7 +57,7 @@ def cps(train, eval_split, alpha=config.ALPHA, delta=config.DELTA,
     certified = [r for r in records if r["certified"]]
     if not certified:
         log("[CPS] nothing certified")
-        return {"method": "CPS", "selected_prompt": None, "fallback": True,
+        return {"method": "CPS", "selected_prompt": None,
                 "n_pool": n, "n_certified": 0, "records": records}
 
     k = len(certified)
@@ -67,41 +71,46 @@ def cps(train, eval_split, alpha=config.ALPHA, delta=config.DELTA,
         "eval_risk": chosen["risk"],
         "eval_risk_ucb": chosen["risk_ucb"],
         "eval_util": chosen["utility"],
-        "fallback": False,
         "n_pool": n,
         "n_certified": k,
         "records": records,
     }
 
 
-def _rewrite(parent, train, alpha, seen, kind, n):
+def _rewrite(parent, train, alpha, seen, template, kind):
+    """Fill one rewriting prompt and ask for one new system prompt."""
     prompt = parent["prompt"]
     risk = parent.get("train_risk", parent.get("risk", 0.0))
-    out = []
+    fields = {
+        "prompt": prompt,
+        "alpha": f"{alpha:.3f}",
+        "risk": f"{risk:.3f}",
+    }
     if kind == "raise":
         fp = _mine(prompt, train, 0, 1)
         tp = _mine(prompt, train, 1, 1) if fp else []
-        rewrite = prompts.rewrite_raise_utility
-        args = (fp, tp)
+        fields["fp"] = prompts._examples(fp, k=3)
+        fields["tp"] = prompts._examples(tp, k=3)
     else:
         fn = _mine(prompt, train, 1, 0)
         tn = _mine(prompt, train, 0, 0) if fn else []
-        rewrite = prompts.rewrite_lower_risk
-        args = (fn, tn)
-    for _ in range(max(n * 2, n + 1)):
-        if len(out) >= n:
-            break
-        cand = rewrite(prompt, *args, alpha, risk)
-        if cand and cand not in seen and len(cand) > 30:
-            seen.add(cand)
-            out.append(cand)
-    return out
+        fields["fn"] = prompts._examples(fn, k=3)
+        fields["tn"] = prompts._examples(tn, k=3)
+    cand = prompts.apply(template, **fields)
+    if cand and cand not in seen and len(cand) > 30:
+        seen.add(cand)
+        return [cand]
+    return []
 
 
-def crisp(train, eval_split, alpha=config.ALPHA, delta=config.DELTA,
-          rounds=config.CRISP_ROUNDS, m=config.CRISP_CANDIDATES_PER_ROUND,
-          log=print):
-    """Adaptive search. Certification uses Guess-and-Check on risk only."""
+def crisp(train, eval_split, seed, rewrite_raise, rewrite_lower,
+          alpha=config.ALPHA, delta=config.DELTA,
+          rounds=config.CRISP_ROUNDS, log=print):
+    """Adaptive search. Certification uses Guess-and-Check on risk only.
+
+    seed is the starting system prompt. rewrite_raise and rewrite_lower
+    are the rewriting prompt strings.
+    """
     tr_texts, tr_labels = _xy(train)
     ev_texts, ev_labels = _xy(eval_split)
     n_mal_h = sum(ev_labels)
@@ -148,11 +157,11 @@ def crisp(train, eval_split, alpha=config.ALPHA, delta=config.DELTA,
         unknown = [r for r in records if not r["certified"]]
         p_minus = min(unknown, key=lambda r: r["train_risk"]) if unknown else None
 
-    seed = score(config.TASK_CFG["seed"])
-    seen.add(seed["prompt"])
-    consider(seed)
-    log(f"[CRISP] seed risk={seed['train_risk']:.3f} "
-        f"util={seed['train_util']:.3f} certified={seed['certified']}")
+    first = score(seed)
+    seen.add(first["prompt"])
+    consider(first)
+    log(f"[CRISP] seed risk={first['train_risk']:.3f} "
+        f"util={first['train_util']:.3f} certified={first['certified']}")
 
     for t in range(1, rounds + 1):
         if p_plus is None and p_minus is None:
@@ -161,13 +170,10 @@ def crisp(train, eval_split, alpha=config.ALPHA, delta=config.DELTA,
             log("[CRISP] holdout budget exhausted")
             break
         new = []
-        if p_plus and p_minus:
-            new += _rewrite(p_plus, train, alpha, seen, "raise", max(1, m // 2))
-            new += _rewrite(p_minus, train, alpha, seen, "lower", max(1, m // 2))
-        elif p_plus:
-            new += _rewrite(p_plus, train, alpha, seen, "raise", max(1, m // 2))
-        else:
-            new += _rewrite(p_minus, train, alpha, seen, "lower", max(1, m // 2))
+        if p_plus:
+            new += _rewrite(p_plus, train, alpha, seen, rewrite_raise, "raise")
+        if p_minus:
+            new += _rewrite(p_minus, train, alpha, seen, rewrite_lower, "lower")
         for cand in new:
             rec = score(cand)
             consider(rec)
@@ -177,7 +183,7 @@ def crisp(train, eval_split, alpha=config.ALPHA, delta=config.DELTA,
     certified = [r for r in records if r["certified"]]
     if not certified:
         log("[CRISP] nothing certified")
-        return {"method": "CRISP", "selected_prompt": None, "fallback": True,
+        return {"method": "CRISP", "selected_prompt": None,
                 "n_pool": len(records), "n_certified": 0, "records": records}
 
     chosen = max(certified, key=lambda r: r["eval_util"])
@@ -188,7 +194,6 @@ def crisp(train, eval_split, alpha=config.ALPHA, delta=config.DELTA,
         "eval_risk": chosen["eval_risk"],
         "eval_util": chosen["eval_util"],
         "gnc_ucb": chosen["gnc_ucb"],
-        "fallback": False,
         "n_pool": len(records),
         "n_certified": len(certified),
         "records": records,

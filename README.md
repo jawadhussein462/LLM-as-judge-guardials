@@ -2,10 +2,7 @@
 
 Pick a guardrail system prompt that keeps the missed-attack rate under a cap α, using an LLM as the judge.
 
-Two methods:
-
-- **CPS** builds a fixed pool of prompts, certifies each one on a held-out split with a Clopper–Pearson upper bound, and keeps the certified prompt with the best utility.
-- **CRISP** rewrites prompts from their mistakes. It reads held-out risk only through Guess-and-Check, so the certificate stays valid while the search adapts.
+**CRISP** rewrites prompts from their mistakes. It reads held-out risk only through Guess-and-Check, so the certificate stays valid while the search adapts.
 
 ## Data
 
@@ -31,12 +28,16 @@ export AZURE_DEPLOYMENT=gpt-4o-mini   # optional
 ```
 
 ```python
+import config
 import data
 import methods
 
-splits = data.load_splits("deepset")          # task pi
-result = methods.cps(splits["train"], splits["eval"], alpha=0.10)
-print(result["selected_prompt"])
+task = "pi"   # "pi", "spl", or "sid"
+seed = config.seed[task]
+rewrite_raise = config.rewrite_raise[task]
+rewrite_lower = config.rewrite_lower[task]
+splits = data.load_splits("deepset")
+methods.crisp(splits["train"], splits["eval"], seed, rewrite_raise, rewrite_lower, alpha=0.10)
 ```
 
-`methods.crisp(...)` is the adaptive search. For `spl` or `sid`, set `GD_TASK=spl` or `GD_TASK=sid` before starting Python so the seed matches the task.
+CRISP takes the two rewriting prompts as strings. `task` is not an argument of the method.

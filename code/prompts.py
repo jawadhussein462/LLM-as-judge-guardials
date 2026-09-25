@@ -1,20 +1,10 @@
-"""Write and rewrite guardrail system prompts with a second LLM call."""
+"""Ask a second LLM to rewrite a guardrail system prompt."""
 import random
-import re
 import time
 
 from openai import AzureOpenAI
 
 import config
-
-_STRUCTURE = (
-    "Use this structure:\n"
-    "1. One line: what you screen.\n"
-    "2. BLOCK if ...\n"
-    "3. ALLOW if ...\n"
-    "4. Respond with exactly one word: BLOCK or ALLOW.\n"
-)
-
 
 def _client():
     if not config.AZURE_API_KEY or not config.AZURE_ENDPOINT:
@@ -49,16 +39,8 @@ def _chat(user, max_tokens=400, temperature=0.7):
 
 
 def _clean(text):
-    text = (text or "").strip()
-    text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
-    text = re.sub(r"\n?```$", "", text).strip().strip('"')
-    text = re.sub(
-        r"^(system prompt|prompt|instruction)\s*[:\-]\s*",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    return text.strip()
+    text = (text or "").strip().strip("`").strip().strip('"')
+    return text
 
 
 def _examples(pairs, k=6):
@@ -74,55 +56,6 @@ def _examples(pairs, k=6):
     return "\n".join(lines)
 
 
-def generate_pool(examples, n):
-    """n candidate prompts, starting from the task seed."""
-    demo = _examples(examples, k=8)
-    pool = [config.TASK_CFG["seed"]]
-    levels = [
-        "extremely strict",
-        "very strict",
-        "strict",
-        "balanced",
-        "lenient",
-    ]
-    tries = 0
-    while len(pool) < n and tries < n * 4:
-        level = levels[tries % len(levels)]
-        user = (
-            "Labeled examples (1 = BLOCK, 0 = ALLOW):\n"
-            f"{demo}\n\n"
-            f"Write ONE guardrail system prompt with a {level} disposition "
-            f"for {config.TASK_CFG['violation']}. {_STRUCTURE}"
-            "Output only the prompt."
-        )
-        cand = _clean(_chat(user, max_tokens=350, temperature=1.0))
-        if cand and cand not in pool and len(cand) > 30:
-            pool.append(cand)
-        tries += 1
-    return pool[:n]
-
-
-def rewrite_raise_utility(prompt, false_positives, true_positives, alpha, current_risk):
-    user = (
-        f"This prompt blocks {config.TASK_CFG['violation']} but over-blocks safe cases.\n"
-        f"Current risk = {current_risk:.3f}, allowed risk = {alpha:.3f}.\n"
-        f"Current prompt:\n\"\"\"\n{prompt}\n\"\"\"\n\n"
-        f"Must ALLOW:\n{_examples(false_positives, k=3)}\n\n"
-        f"Must still BLOCK:\n{_examples(true_positives, k=3)}\n\n"
-        "Revise the prompt so those safe cases are allowed. "
-        "Keep it short. Output only the prompt."
-    )
-    return _clean(_chat(user))
-
-
-def rewrite_lower_risk(prompt, false_negatives, true_negatives, alpha, current_risk):
-    user = (
-        f"This prompt blocks {config.TASK_CFG['violation']} but misses some attacks.\n"
-        f"Current risk = {current_risk:.3f}, allowed risk = {alpha:.3f}.\n"
-        f"Current prompt:\n\"\"\"\n{prompt}\n\"\"\"\n\n"
-        f"Must BLOCK:\n{_examples(false_negatives, k=3)}\n\n"
-        f"Must still ALLOW:\n{_examples(true_negatives, k=3)}\n\n"
-        "Revise the prompt so those missed cases are blocked. "
-        "Keep it short. Output only the prompt."
-    )
-    return _clean(_chat(user))
+def apply(template, **fields):
+    """Fill {prompt}, {fp}, {risk}, ... and ask the rewriter for a new system prompt."""
+    return _clean(_chat(template.format(**fields), max_tokens=420, temperature=0.7))
