@@ -5,7 +5,13 @@
 
   deepset, bipia   prompt injection (user message)
   spl              system-prompt leakage (assistant reply)
-  sid              sensitive-information disclosure (assistant reply)
+  sid              sensitive-information disclosure (BeaverTails)
+
+sid_all.parquet is BeaverTails (PKU-Alignment/BeaverTails, 30k_train and
+30k_test). y=1 if category includes privacy_violation; y=0 if is_safe;
+other categories are dropped. Each text is a fixed protected-item list,
+the user request, and the assistant response. Classes are balanced at
+1,500 before the 0.20/0.60/0.20 split.
 
 Each file is local parquet with columns text, label.
 """

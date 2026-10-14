@@ -13,7 +13,7 @@ Parquet files in `data/`, each with columns `text` and `label` (`1` = block, `0`
 | `deepset` | prompt injection |
 | `bipia` | prompt injection |
 | `spl` | system-prompt leakage |
-| `sid` | sensitive-information disclosure |
+| `sid` | sensitive-information disclosure (BeaverTails privacy violation) |
 
 ```bash
 cd code && python data.py
